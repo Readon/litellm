@@ -1491,3 +1491,57 @@ def test_tool_use_not_dropped_when_finish_reason_already_set(
     )
     assert tool_calls[0].id == "call_1"
     assert tool_calls[0].function.name == "get_weather"
+
+
+def test_is_chunk_non_empty_with_reasoning_in_completion_obj(
+    initialized_custom_stream_wrapper: CustomStreamWrapper,
+):
+    """Unit test that is_chunk_non_empty returns True when completion_obj has 'reasoning' key.
+
+    This ensures chunks with only reasoning content are not silently discarded.
+    See: https://github.com/BerriAI/litellm/issues/20246
+    """
+    empty_model_response = ModelResponseStream(**{
+        "id": "test-id",
+        "object": "chat.completion.chunk",
+        "created": 1234567890,
+        "model": "test-model",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": None},
+                "finish_reason": None,
+            }
+        ],
+    })
+    result = initialized_custom_stream_wrapper.is_chunk_non_empty(
+        completion_obj={"content": "", "reasoning": "Let me think..."},
+        model_response=empty_model_response,
+        response_obj={},
+    )
+    assert result is True
+
+
+def test_is_chunk_non_empty_with_none_reasoning_in_completion_obj(
+    initialized_custom_stream_wrapper: CustomStreamWrapper,
+):
+    """Unit test that is_chunk_non_empty returns False when completion_obj has None 'reasoning'."""
+    empty_model_response = ModelResponseStream(**{
+        "id": "test-id",
+        "object": "chat.completion.chunk",
+        "created": 1234567890,
+        "model": "test-model",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": None},
+                "finish_reason": None,
+            }
+        ],
+    })
+    result = initialized_custom_stream_wrapper.is_chunk_non_empty(
+        completion_obj={"content": "", "reasoning": None},
+        model_response=empty_model_response,
+        response_obj={},
+    )
+    assert result is False

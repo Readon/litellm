@@ -7,7 +7,10 @@ sys.path.insert(
     0, os.path.abspath("../../../../..")
 )  # Adds the parent directory to the system path
 
-from litellm.llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
+from litellm.llms.hosted_vllm.chat.transformation import (
+    HostedVLLMChatConfig,
+    HostedVLLMChatCompletionStreamingHandler,
+)
 
 
 def test_hosted_vllm_chat_transformation_file_url():
@@ -257,3 +260,75 @@ def test_hosted_vllm_thinking_blocks_with_list_content():
     }
     assert assistant_msg["content"][2] == {"type": "text", "text": "Response text"}
     assert "thinking_blocks" not in assistant_msg
+
+
+def test_hosted_vllm_streaming_handler_maps_reasoning_to_reasoning_content():
+    """
+    Test that HostedVLLMChatCompletionStreamingHandler maps delta.reasoning
+    to delta.reasoning_content (as required by LiteLLM internals).
+
+    vLLM/SGLang returns delta.reasoning for thinking models, but LiteLLM
+    expects delta.reasoning_content.
+    """
+    handler = HostedVLLMChatCompletionStreamingHandler(
+        streaming_response=iter([]),
+        sync_stream=True,
+    )
+    chunk = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 1234567890,
+        "model": "Qwen3.5-27B-FP8",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"reasoning": "Let me think...", "role": "assistant"},
+                "finish_reason": None,
+            }
+        ],
+    }
+    result = handler.chunk_parser(chunk)
+    delta = result.choices[0].delta
+    # 'reasoning' should be mapped to 'reasoning_content'
+    assert delta.reasoning_content == "Let me think..."
+    assert not hasattr(delta, "reasoning") or delta.reasoning is None
+
+
+def test_hosted_vllm_streaming_handler_preserves_reasoning_content():
+    """
+    Test that HostedVLLMChatCompletionStreamingHandler passes through
+    delta.reasoning_content unchanged (when already mapped).
+    """
+    handler = HostedVLLMChatCompletionStreamingHandler(
+        streaming_response=iter([]),
+        sync_stream=True,
+    )
+    chunk = {
+        "id": "chatcmpl-test",
+        "object": "chat.completion.chunk",
+        "created": 1234567890,
+        "model": "Qwen3.5-27B-FP8",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"reasoning_content": "Already mapped", "role": "assistant"},
+                "finish_reason": None,
+            }
+        ],
+    }
+    result = handler.chunk_parser(chunk)
+    delta = result.choices[0].delta
+    assert delta.reasoning_content == "Already mapped"
+
+
+def test_hosted_vllm_get_model_response_iterator_returns_correct_handler():
+    """
+    Test that HostedVLLMChatConfig.get_model_response_iterator returns
+    a HostedVLLMChatCompletionStreamingHandler instance.
+    """
+    config = HostedVLLMChatConfig()
+    iterator = config.get_model_response_iterator(
+        streaming_response=iter([]),
+        sync_stream=True,
+    )
+    assert isinstance(iterator, HostedVLLMChatCompletionStreamingHandler)

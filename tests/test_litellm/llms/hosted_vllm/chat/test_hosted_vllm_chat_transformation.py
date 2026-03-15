@@ -3,12 +3,14 @@ import os
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 sys.path.insert(
     0, os.path.abspath("../../../../..")
 )  # Adds the parent directory to the system path
 
+import litellm
 from litellm.llms.hosted_vllm.chat.transformation import HostedVLLMChatConfig
-from litellm.llms.openai.chat.gpt_transformation import OpenAIChatCompletionStreamingHandler
 
 
 def test_hosted_vllm_chat_transformation_file_url():
@@ -260,71 +262,176 @@ def test_hosted_vllm_thinking_blocks_with_list_content():
     assert "thinking_blocks" not in assistant_msg
 
 
-def test_hosted_vllm_streaming_maps_reasoning_to_reasoning_content():
-    """
-    Test that the hosted_vllm streaming handler (OpenAIChatCompletionStreamingHandler,
-    used by default via OpenAIGPTConfig inheritance) maps delta.reasoning to
-    delta.reasoning_content.
+# --- End-to-end streaming tests using respx ---
+# These tests mock the vLLM HTTP endpoint with real SSE payloads containing
+# delta.reasoning (as vLLM/SGLang returns for thinking models) and verify that
+# LiteLLM's gateway correctly converts delta.reasoning → delta.reasoning_content
+# before the chunks reach the caller.
+# See: https://github.com/BerriAI/litellm/issues/20246
 
-    vLLM/SGLang returns delta.reasoning for thinking models, but LiteLLM
-    expects delta.reasoning_content. This mapping is handled by
+
+def _make_sse_body(chunks: list) -> str:
+    """Encode a list of chunk dicts as an SSE body (as vLLM would produce)."""
+    lines = []
+    for chunk in chunks:
+        lines.append("data: " + json.dumps(chunk) + "\n\n")
+    lines.append("data: [DONE]\n\n")
+    return "".join(lines)
+
+
+@pytest.mark.respx()
+def test_hosted_vllm_gateway_converts_delta_reasoning_to_reasoning_content(respx_mock):
+    """
+    End-to-end test: a vLLM backend returns streaming SSE chunks where the delta
+    contains a 'reasoning' field (not 'reasoning_content').  LiteLLM must remap
+    delta.reasoning → delta.reasoning_content before yielding chunks to callers.
+
+    vLLM/SGLang uses delta.reasoning for thinking models; LiteLLM's public API
+    exposes reasoning_content.  The mapping happens inside
     OpenAIChatCompletionStreamingHandler._map_reasoning_to_reasoning_content,
-    which HostedVLLMChatConfig uses via inheritance from OpenAIGPTConfig.
+    which HostedVLLMChatConfig inherits from OpenAIGPTConfig.
 
     See: https://github.com/BerriAI/litellm/issues/20246
     """
-    config = HostedVLLMChatConfig()
-    handler = config.get_model_response_iterator(
-        streaming_response=iter([]),
-        sync_stream=True,
+    litellm.disable_aiohttp_transport = True
+
+    vllm_sse_body = _make_sse_body([
+        {
+            "id": "chatcmpl-vllm-01",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "Qwen3-30B-A3B",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "reasoning": "Step 1: analyze the problem."},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-vllm-01",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "Qwen3-30B-A3B",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"reasoning": " Step 2: conclude."},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-vllm-01",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "Qwen3-30B-A3B",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "The answer is 42."},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+    ])
+
+    respx_mock.post("https://test-vllm.example.com/v1/chat/completions").respond(
+        status_code=200,
+        headers={"content-type": "text/event-stream"},
+        content=vllm_sse_body,
     )
-    # The default handler is OpenAIChatCompletionStreamingHandler
-    assert isinstance(handler, OpenAIChatCompletionStreamingHandler)
 
-    chunk = {
-        "id": "chatcmpl-test",
-        "object": "chat.completion.chunk",
-        "created": 1234567890,
-        "model": "Qwen3.5-27B-FP8",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"reasoning": "Let me think...", "role": "assistant"},
-                "finish_reason": None,
-            }
-        ],
-    }
-    result = handler.chunk_parser(chunk)
-    delta = result.choices[0].delta
-    # 'reasoning' must be mapped to 'reasoning_content'
-    assert delta.reasoning_content == "Let me think..."
-    assert not hasattr(delta, "reasoning") or delta.reasoning is None
-
-
-def test_hosted_vllm_streaming_preserves_reasoning_content():
-    """
-    Test that the hosted_vllm streaming handler passes through
-    delta.reasoning_content unchanged when already set.
-    """
-    config = HostedVLLMChatConfig()
-    handler = config.get_model_response_iterator(
-        streaming_response=iter([]),
-        sync_stream=True,
+    response = litellm.completion(
+        model="hosted_vllm/Qwen3-30B-A3B",
+        messages=[{"role": "user", "content": "What is 6*7?"}],
+        api_base="https://test-vllm.example.com/v1",
+        stream=True,
     )
-    chunk = {
-        "id": "chatcmpl-test",
-        "object": "chat.completion.chunk",
-        "created": 1234567890,
-        "model": "Qwen3.5-27B-FP8",
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"reasoning_content": "Already mapped", "role": "assistant"},
-                "finish_reason": None,
-            }
-        ],
-    }
-    result = handler.chunk_parser(chunk)
-    delta = result.choices[0].delta
-    assert delta.reasoning_content == "Already mapped"
+
+    chunks = list(response)
+
+    # All chunks with reasoning_content set must NOT have a raw 'reasoning' attribute
+    reasoning_chunks = [
+        c for c in chunks
+        if getattr(c.choices[0].delta, "reasoning_content", None) is not None
+    ]
+    assert len(reasoning_chunks) >= 1, (
+        "Expected at least one chunk with reasoning_content, "
+        f"got chunks: {[c.choices[0].delta for c in chunks]}"
+    )
+    for chunk in reasoning_chunks:
+        delta = chunk.choices[0].delta
+        # The converted field must be named reasoning_content
+        assert delta.reasoning_content is not None
+        # The raw vLLM field must NOT leak through
+        assert not hasattr(delta, "reasoning") or delta.reasoning is None
+
+    # The final content chunk must still be delivered correctly
+    content_chunks = [
+        c for c in chunks
+        if getattr(c.choices[0].delta, "content", None)
+    ]
+    assert any("42" in c.choices[0].delta.content for c in content_chunks)
+
+
+@pytest.mark.respx()
+def test_hosted_vllm_gateway_preserves_reasoning_content_passthrough(respx_mock):
+    """
+    End-to-end test: if a vLLM backend already returns delta.reasoning_content
+    (rather than delta.reasoning), LiteLLM must pass it through unchanged.
+    """
+    litellm.disable_aiohttp_transport = True
+
+    vllm_sse_body = _make_sse_body([
+        {
+            "id": "chatcmpl-vllm-02",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "Qwen3-30B-A3B",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "reasoning_content": "Already mapped."},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-vllm-02",
+            "object": "chat.completion.chunk",
+            "created": 1234567890,
+            "model": "Qwen3-30B-A3B",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "Done."},
+                    "finish_reason": "stop",
+                }
+            ],
+        },
+    ])
+
+    respx_mock.post("https://test-vllm.example.com/v1/chat/completions").respond(
+        status_code=200,
+        headers={"content-type": "text/event-stream"},
+        content=vllm_sse_body,
+    )
+
+    response = litellm.completion(
+        model="hosted_vllm/Qwen3-30B-A3B",
+        messages=[{"role": "user", "content": "Test"}],
+        api_base="https://test-vllm.example.com/v1",
+        stream=True,
+    )
+
+    chunks = list(response)
+    reasoning_chunks = [
+        c for c in chunks
+        if getattr(c.choices[0].delta, "reasoning_content", None) is not None
+    ]
+    assert len(reasoning_chunks) >= 1
+    assert reasoning_chunks[0].choices[0].delta.reasoning_content == "Already mapped."
+
 
